@@ -29,5 +29,8 @@ COMPONENT_SRCDIRS := \
 src/common src/vos/common \
 src/vos/esp
 
+# tau_so_if.c is only built with SOA_SUPPORT (see Makefile) and does not compile without it
+COMPONENT_OBJEXCLUDE := src/common/tau_so_if.o
+
 CFLAGS += -Wall -DESP32 -I src/vos/esp -I src/api -Wno-unknown-pragmas -Wno-char-subscripts -Wno-format -DL_ENDIAN
 

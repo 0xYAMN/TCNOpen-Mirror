@@ -63,6 +63,9 @@
 #define PTHREAD_STACK_MIN   1024
 #endif
 
+/* ESP-IDF (newlib) has no getpagesize(). Stack sizes are rounded up to this granularity. */
+#define VOS_STACK_ROUND_SIZE    4096u
+
 const size_t    cDefaultStackSize   = 4u * PTHREAD_STACK_MIN;
 const UINT32    cMutextMagic        = 0x1234FEDCu;
 
@@ -249,9 +252,9 @@ EXT_DECL VOS_ERR_T vos_threadCreate (
     /* Set the stack size */
     if (stackSize > PTHREAD_STACK_MIN)
     {
-        if (stackSize % (UINT32)getpagesize() > 0u)
+        if (stackSize % VOS_STACK_ROUND_SIZE > 0u)
         {
-            stackSize = ((stackSize / (UINT32)getpagesize()) + 1u) * (UINT32)getpagesize();
+            stackSize = ((stackSize / VOS_STACK_ROUND_SIZE) + 1u) * VOS_STACK_ROUND_SIZE;
         }
         retCode = pthread_attr_setstacksize(&threadAttrib, (size_t) stackSize);
     }

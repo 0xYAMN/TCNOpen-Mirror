@@ -44,7 +44,6 @@
 #include "vos_utils.h"
 #include "vos_sock.h"
 #include "vos_private.h"
-#include <byteswap.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -57,6 +56,77 @@ extern "C" {
 /***********************************************************************************************************************
  *  LOCALS
  */
+
+/**********************************************************************************************************************/
+/** recvfrom() that also reports the destination address of the datagram.
+ *
+ *  Uses recvmsg() with IP_PKTINFO. Define TRDP_ESP_LWIP_RECVFROMDEST to use recvfromdest() instead.
+ *
+ *  The destination address is only reported when CONFIG_LWIP_NETBUF_RECVINFO=y, which is off by default in ESP-IDF and
+ *  the Arduino-ESP32 SDK. Otherwise it is returned as 0 (INADDR_ANY).
+ */
+#ifdef TRDP_ESP_LWIP_RECVFROMDEST
+#define vosRecvFromDest recvfromdest
+#else
+static int vosRecvFromDest (
+    int                 sock,
+    void                *buf,
+    size_t              len,
+    int                 flags,
+    struct sockaddr     *from,
+    socklen_t           *fromLen,
+    struct sockaddr     *dest,
+    socklen_t           *destLen)
+{
+    struct iovec        iov;
+    struct msghdr       msg;
+    struct sockaddr_in  *pDest = (struct sockaddr_in *) dest;
+    struct cmsghdr      *pCmsg;
+    union
+    {
+        struct cmsghdr  hdr;
+        char            space[CMSG_SPACE(sizeof(struct in_pktinfo))];
+    } ctrl;
+    int                 rcvSize;
+
+    iov.iov_base    = buf;
+    iov.iov_len     = len;
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_name        = from;
+    msg.msg_namelen     = (fromLen != NULL) ? *fromLen : 0u;
+    msg.msg_iov         = &iov;
+    msg.msg_iovlen      = 1;
+    memset(&ctrl, 0, sizeof(ctrl));
+    msg.msg_control     = &ctrl;
+    msg.msg_controllen  = sizeof(ctrl);
+
+    rcvSize = (int) recvmsg(sock, &msg, flags);
+    if (rcvSize < 0)
+    {
+        return rcvSize;
+    }
+    if (fromLen != NULL)
+    {
+        *fromLen = msg.msg_namelen;
+    }
+    if ((pDest != NULL) && (destLen != NULL))
+    {
+        memset(pDest, 0, sizeof(*pDest));
+        pDest->sin_family = AF_INET;
+        for (pCmsg = CMSG_FIRSTHDR(&msg); pCmsg != NULL; pCmsg = CMSG_NXTHDR(&msg, pCmsg))
+        {
+            if ((pCmsg->cmsg_level == IPPROTO_IP) && (pCmsg->cmsg_type == IP_PKTINFO))
+            {
+                struct in_pktinfo pktInfo;
+                memcpy(&pktInfo, CMSG_DATA(pCmsg), sizeof(pktInfo));
+                pDest->sin_addr = pktInfo.ipi_addr;
+            }
+        }
+        *destLen = sizeof(*pDest);
+    }
+    return rcvSize;
+}
+#endif
 
 static int gVosSockInitialised = FALSE;
 
@@ -104,7 +174,8 @@ EXT_DECL UINT64 vos_htonll (
     UINT64 val)
     {
 #   ifdef L_ENDIAN
-        return __bswap_64(val);
+        /* Swap the two 32-bit halves, each in network order (<byteswap.h> is glibc-only, not available on ESP-IDF) */
+        return ((UINT64) htonl((UINT32) val) << 32) | (UINT64) htonl((UINT32) (val >> 32));
 #   else
         return val;
 #   endif
@@ -563,7 +634,8 @@ EXT_DECL VOS_ERR_T vos_sockSetOptions (
     {
         char buff[VOS_MAX_ERR_STR_SIZE];
         STRING_ERR(buff);
-        vos_printLog(VOS_LOG_ERROR, "setsockopt() IP_PKTINFO failed (Err: %s)\n", buff);
+        /* Fails unless CONFIG_LWIP_NETBUF_RECVINFO=y; the destination address is then reported as 0 */
+        vos_printLog(VOS_LOG_WARNING, "setsockopt() IP_PKTINFO failed (Err: %s)\n", buff);
     }
 #elif defined(IP_RECVDSTADDR)
     if (setsockopt(sock, IPPROTO_IP, IP_RECVDSTADDR, &sockOptValue, sizeof(sockOptValue)) == -1)
@@ -856,10 +928,8 @@ EXT_DECL VOS_ERR_T vos_sockReceiveUDP (
     do
     {
 
-        /* Note: recvfromdest is a call to a patched version of the lwip stack!
-         The original recvfrom version does not provide such a call, neither does it provide the recvmsg() function!
-         */
-        rcvSize = recvfromdest(sock, buf, *pSize, MSG_DONTWAIT, (struct sockaddr *) &si_other, (socklen_t *)&slen,
+        /* Destination address is 0 unless CONFIG_LWIP_NETBUF_RECVINFO=y (see vosRecvFromDest) */
+        rcvSize = vosRecvFromDest(sock, buf, *pSize, MSG_DONTWAIT, (struct sockaddr *) &si_other, (socklen_t *)&slen,
                                (struct sockaddr *) &dest, (socklen_t *)&dlen);
 
         if (rcvSize != -1)
@@ -1125,6 +1195,28 @@ EXT_DECL VOS_IP4_ADDR_T vos_determineBindAddr ( VOS_IP4_ADDR_T  srcIP,
         return srcIP;
     }
 }
+/**********************************************************************************************************************/
+/** Check if an interface with the given VLAN ID and IP exists.
+ *  ESP32 has no VLAN sub-interfaces, so only the "no VLAN" case is accepted.
+ *
+ *  @param[in]      vlanId          VLAN ID to find (0 = no VLAN, the only value accepted)
+ *  @param[in]      ipAddr          IP to find (0 = match any)
+ *
+ *  @retval         VOS_NO_ERR      no VLAN (vlanId 0)
+ *  @retval         VOS_PARAM_ERR   any other vlanId (no VLAN sub-interfaces on ESP32)
+ */
+EXT_DECL VOS_ERR_T vos_ifnameFromVlanId (
+    UINT16          vlanId,
+    VOS_IP4_ADDR_T  ipAddr)
+{
+    (void) ipAddr;
+    if (vlanId == 0u)
+    {
+        return VOS_NO_ERR;
+    }
+    return VOS_PARAM_ERR;
+}
+
 #ifdef __cplusplus
 }
 #endif

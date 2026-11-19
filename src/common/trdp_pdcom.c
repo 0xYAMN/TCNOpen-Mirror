@@ -819,8 +819,12 @@ TRDP_ERR_T  trdp_pdReceive (
             UINT32 newSeqCnt = vos_ntohl(pNewFrameHead->sequenceCounter);   /* same location for PD and PD2 */
             /* Save the source IP address of the received packet */
             pExistingElement->lastSrcIP = subAddresses.srcIpAddr;
-            /* Save the real destination of the received packet (own IP or MC group) */
-            pExistingElement->addr.destIpAddr = subAddresses.destIpAddr;
+            /* Save the real destination of the received packet (own IP or MC group).
+               Ports that cannot report it return 0; keep the configured destination in that case. */
+            if (subAddresses.destIpAddr != 0u)
+            {
+                pExistingElement->addr.destIpAddr = subAddresses.destIpAddr;
+            }
 
 
             if ((newSeqCnt == 0u) ||                                /* restarted or new sender  */
